@@ -28,7 +28,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 import lightgbm as lgb
 import numpy as np
 from sklearn.metrics import fbeta_score, precision_score, recall_score
-from sklearn.model_selection import train_test_split
+from sklearn.model_selection import GroupShuffleSplit
 
 from src.blocking import (
     build_blocking_index,
@@ -84,7 +84,8 @@ def build_candidate_pairs(
     s3_rows: list[dict],
     gt_rows: list[dict],
 ):
-    """Return (pairs, labels) where pairs is a list of (s1_row, cand_row)."""
+    """Return (pairs, labels, groups) where pairs is a list of (s1_row, cand_row)
+    and groups is a parallel list of source1_entity_id strings (one per pair)."""
     print("[2/5] Building blocking index and generating candidates …", flush=True)
     t0 = time.time()
 
@@ -113,6 +114,7 @@ def build_candidate_pairs(
 
     pairs: list[tuple[dict, dict]] = []
     labels: list[int] = []
+    groups: list[str] = []
     total_pos = 0
     total_neg = 0
 
@@ -140,6 +142,7 @@ def build_candidate_pairs(
             label = 1 if cid in true_matches else 0
             pairs.append((s1_row, cand_row))
             labels.append(label)
+            groups.append(s1_id)
             if label == 1:
                 total_pos += 1
             else:
@@ -150,7 +153,7 @@ def build_candidate_pairs(
         f"({time.time()-t0:.1f}s)",
         flush=True,
     )
-    return pairs, labels
+    return pairs, labels, groups
 
 
 # ---------------------------------------------------------------------------
@@ -178,17 +181,35 @@ def train_model(
     X: np.ndarray,
     y: np.ndarray,
     feature_names: list[str],
+    groups: np.ndarray,
 ):
-    """Train an 80/20 split LightGBM classifier; return (model, X_val, y_val)."""
-    print("[4/5] Training LightGBM (80/20 split) …", flush=True)
+    """Train a group-aware 80/20 split LightGBM classifier.
+
+    The split is grouped by source1_entity_id so that ALL candidate pairs for
+    a given S1 entity land entirely in train or validation — never both.
+    This prevents leakage from entity-specific patterns.
+
+    Returns (model, X_val, y_val).
+    """
+    print("[4/5] Training LightGBM (80/20 grouped split by S1 entity) …", flush=True)
     t0 = time.time()
 
-    X_train, X_val, y_train, y_val = train_test_split(
-        X, y, test_size=0.2, random_state=RANDOM_STATE, stratify=y
-    )
+    gss = GroupShuffleSplit(n_splits=1, test_size=0.2, random_state=RANDOM_STATE)
+    train_idx, val_idx = next(gss.split(X, y, groups=groups))
+
+    X_train, X_val = X[train_idx], X[val_idx]
+    y_train, y_val = y[train_idx], y[val_idx]
+
+    n_train_entities = len(np.unique(groups[train_idx]))
+    n_val_entities   = len(np.unique(groups[val_idx]))
+
     print(
         f"      train={len(y_train):,}  val={len(y_val):,}  "
         f"pos_train={y_train.sum():,}  pos_val={y_val.sum():,}",
+        flush=True,
+    )
+    print(
+        f"      S1 entities — train={n_train_entities:,}  val={n_val_entities:,}",
         flush=True,
     )
 
@@ -298,7 +319,7 @@ def main():
     s1_rows, s2_rows, s3_rows, gt_rows = load_aligned_sample(SAMPLE_SIZE)
 
     # 2. Candidate pairs + labels
-    pairs, labels = build_candidate_pairs(s1_rows, s2_rows, s3_rows, gt_rows)
+    pairs, labels, groups = build_candidate_pairs(s1_rows, s2_rows, s3_rows, gt_rows)
 
     if not pairs:
         print("ERROR: No candidate pairs generated. Check blocking index.", file=sys.stderr)
@@ -307,13 +328,14 @@ def main():
     # 3. Feature matrix
     X, feature_names = build_feature_matrix(pairs)
     y = np.array(labels, dtype=np.int32)
+    groups_arr = np.array(groups)
 
     if y.sum() == 0:
         print("ERROR: No positive labels found. Check GT alignment.", file=sys.stderr)
         sys.exit(1)
 
-    # 4. Train
-    model, X_val, y_val = train_model(X, y, feature_names)
+    # 4. Train (grouped split)
+    model, X_val, y_val = train_model(X, y, feature_names, groups_arr)
 
     # 5. Evaluate
     results = evaluate(model, X_val, y_val, feature_names)
