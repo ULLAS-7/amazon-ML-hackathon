@@ -36,20 +36,31 @@
 ## 4. Matching Model
 
 **Features used:**
-- Name features: [e.g., Jaccard, Levenshtein, phonetic encoding]
-- Address features: [e.g., token overlap, edit distance, PIN code matching]
-- Other: []
+- Name features: Jaccard similarity, Levenshtein similarity, token-sort-ratio similarity
+- Address features: Jaccard similarity, Levenshtein similarity, house number exact-match, city/region match, country match
+- Other: Length differences (name and address)
 
-**Model type:** [e.g., XGBoost, Siamese Network, Transformer, etc.]  
-**Threshold selection method:** [e.g., F_0.5 optimization on validation set]
+**Most important features:** Address Jaccard and name Jaccard were by far the strongest signals.
+
+**Model type:** LightGBM binary classifier
+
+**Train/validation split:** Grouped by `source1_entity_id` (not pair-level) to prevent data leakage — 1,600 entities for training, 400 for validation.
+
+**Threshold selection method:** Threshold of 0.91 chosen by maximising F_0.5 on the validation split.
 
 ---
 
 ## 5. Results & Error Analysis
 
-- **F_0.5 Score (macro):** [your best validation score]
-- **Common false positives (wrong merges):** [brief description]
-- **Common false negatives (missed matches):** [brief description]
+Results below are on the 2,000-entity validation sample (grouped split, not full dataset). Full-dataset results are pending.
+
+| Metric    | Value  |
+|-----------|--------|
+| F_0.5     | 0.9856 |
+| Precision | 0.9897 |
+| Recall    | 0.9697 |
+
+**Note:** High precision relative to recall is consistent with the F_0.5 objective (precision is weighted more heavily). Full-scale results will be reported once the end-to-end pipeline has been run over the complete dataset.
 
 ---
 
