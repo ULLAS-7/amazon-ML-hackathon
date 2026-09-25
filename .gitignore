@@ -1,8 +1,40 @@
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Virtual environments
+venv/
+.venv/
+env/
+
+# Environment files
+.env
+
+# Data — raw large files (never commit; use DVC or download separately)
 data/raw/*
 !data/raw/.gitkeep
+
+# Model artefacts
 *.pkl
 *.h5
-__pycache__/
-.ipynb_checkpoints/
-venv/
-.env
+*.pt
+*.bin
+
+# Output files (generated; not source)
+output/
+
+# macOS metadata
+.DS_Store
+
+# Large dataset TSV files (all >10 MB — excluded from version control)
+dataset/train/train_source1.tsv
+dataset/train/train_source2.tsv
+dataset/train/train_source3.tsv
+dataset/train/train_ground_truth.tsv
+dataset/test/test_source1.tsv
+dataset/test/test_source2.tsv
+dataset/test/test_source3.tsv
