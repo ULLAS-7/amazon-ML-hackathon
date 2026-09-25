@@ -38,3 +38,8 @@ dataset/train/train_ground_truth.tsv
 dataset/test/test_source1.tsv
 dataset/test/test_source2.tsv
 dataset/test/test_source3.tsv
+
+# Exception: dummy fixtures for end-to-end testing (small, synthetic, safe to track)
+!dataset/test/test_source1.tsv
+!dataset/test/test_source2.tsv
+!dataset/test/test_source3.tsv

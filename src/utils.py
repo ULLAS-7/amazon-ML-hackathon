@@ -1,3 +1,4 @@
+import csv
 import os
 import pandas as pd
 
@@ -5,6 +6,84 @@ import pandas as pd
 # Adjust these once the actual dataset columns are visible.
 ENTITY_ID_COL = 'entity_id'
 MATCHES_COL = 'matches'
+
+# ---------------------------------------------------------------------------
+# Output writers
+# ---------------------------------------------------------------------------
+
+def write_matching_results(results: dict, output_path: str) -> None:
+    """Write entity-matching results to a tab-separated TSV file.
+
+    Parameters
+    ----------
+    results     : dict mapping source1_entity_id (str) to a list/set of
+                  matched entity IDs from Source 2 / Source 3 (str).
+                  An empty list/set means the S1 entity is a singleton.
+    output_path : str — destination file path (created if absent; parent
+                  directory must already exist).
+
+    Output format
+    -------------
+    Two tab-separated columns::
+
+        source1_entity_id\\tmatched_entity_ids
+        S1-00001\\tS2-00047,S2-00193,S3-00812
+        S1-00002\\tS3-00004
+        S1-00003\\t
+
+    - One row per Source 1 entity (singletons get an empty second column).
+    - IDs within ``matched_entity_ids`` are comma-separated, no spaces.
+    - File is UTF-8 with Unix line endings.
+    """
+    os.makedirs(os.path.dirname(output_path) if os.path.dirname(output_path) else ".", exist_ok=True)
+    with open(output_path, "w", encoding="utf-8", newline="") as fh:
+        writer = csv.writer(fh, delimiter="\t", lineterminator="\n")
+        writer.writerow(["source1_entity_id", "matched_entity_ids"])
+        for s1_id, matched_ids in sorted(results.items()):
+            # Deduplicate while preserving a deterministic order
+            seen: dict = {}
+            for mid in matched_ids:
+                seen[mid] = None
+            writer.writerow([s1_id, ",".join(seen.keys())])
+    print(f"[write_matching_results] wrote {len(results)} rows → {output_path}")
+
+
+def write_candidate_pairs(candidates: dict, output_path: str) -> None:
+    """Write blocking candidate pairs to a tab-separated TSV file.
+
+    Parameters
+    ----------
+    candidates  : dict mapping source1_entity_id (str) to a list/set of
+                  candidate entity IDs from Source 2 / Source 3 (str).
+                  An empty list/set means no blocking candidates were found.
+    output_path : str — destination file path (created if absent; parent
+                  directory must already exist).
+
+    Output format
+    -------------
+    Two tab-separated columns::
+
+        source1_entity_id\\tcandidate_entity_ids
+        S1-00001\\tS2-00047,S2-00193,S3-00812,S3-00999
+        S1-00002\\tS3-00004
+        S1-00003\\t
+
+    - One row per Source 1 entity (no candidates → empty second column).
+    - IDs within ``candidate_entity_ids`` are comma-separated, no spaces.
+    - Every ID in ``matching_results.tsv`` should appear in the corresponding
+      candidate list (the validator warns when this is violated).
+    - File is UTF-8 with Unix line endings.
+    """
+    os.makedirs(os.path.dirname(output_path) if os.path.dirname(output_path) else ".", exist_ok=True)
+    with open(output_path, "w", encoding="utf-8", newline="") as fh:
+        writer = csv.writer(fh, delimiter="\t", lineterminator="\n")
+        writer.writerow(["source1_entity_id", "candidate_entity_ids"])
+        for s1_id, candidate_ids in sorted(candidates.items()):
+            seen: dict = {}
+            for cid in candidate_ids:
+                seen[cid] = None
+            writer.writerow([s1_id, ",".join(seen.keys())])
+    print(f"[write_candidate_pairs] wrote {len(candidates)} rows → {output_path}")
 
 
 def load_tsv(filepath):
