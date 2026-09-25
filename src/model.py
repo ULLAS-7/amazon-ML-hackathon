@@ -7,9 +7,19 @@ Pipeline
 2. Build a blocking index and generate candidate pairs via blocking.get_candidates.
 3. Label each candidate pair: 1 if the candidate is a true match per GT, else 0.
 4. Compute pairwise features via features.compute_pair_features.
-5. Train a LightGBM binary classifier on an 80/20 train/val split.
+5. Train a LightGBM binary classifier on a grouped 80/20 train/val split
+   (grouped by source1_entity_id to prevent leakage).
 6. Select the probability threshold that maximises F_0.5 on validation.
-7. Report F_0.5, precision, recall, chosen threshold, and top-5 feature importances.
+7. Save the trained model to models/matcher.txt and threshold to
+   models/threshold.json.
+8. Report F_0.5, precision, recall, chosen threshold, and top-5 feature
+   importances.
+
+Inference
+---------
+predict_matches(candidate_pairs, model_path, threshold) loads the saved model,
+computes features, applies the threshold, and returns predictions grouped as
+{source1_entity_id: [matched_entity_ids]}.
 
 Usage
 -----
@@ -18,6 +28,7 @@ Usage
 
 from __future__ import annotations
 
+import json
 import os
 import sys
 import time
@@ -52,6 +63,10 @@ S3_PATH = os.path.join(TRAIN_DIR, "train_source3.tsv")
 
 SAMPLE_SIZE = 2000
 RANDOM_STATE = 42
+
+MODELS_DIR    = os.path.join(REPO_ROOT, "models")
+MODEL_PATH    = os.path.join(MODELS_DIR, "matcher.txt")
+THRESHOLD_PATH = os.path.join(MODELS_DIR, "threshold.json")
 
 
 # ---------------------------------------------------------------------------
@@ -305,7 +320,130 @@ def evaluate(
         "precision": final_prec,
         "recall": final_rec,
         "feature_importances": fi,
+        # expose raw val data so main() can run sanity-check without re-splitting
+        "_val_probs": probs,
+        "_val_labels": y_val,
     }
+
+
+# ---------------------------------------------------------------------------
+# Inference — predict_matches
+# ---------------------------------------------------------------------------
+
+def predict_matches(
+    candidate_pairs: list[tuple[dict, dict]],
+    model_path: str = MODEL_PATH,
+    threshold: float | None = None,
+    threshold_path: str = THRESHOLD_PATH,
+) -> dict[str, list[str]]:
+    """Load a saved model and predict true matches for candidate pairs.
+
+    Parameters
+    ----------
+    candidate_pairs : list of (s1_row, candidate_row) tuples — the same format
+        produced by blocking.get_candidates.  Each row is a dict with keys
+        entity_id, business_name, business_address, country.
+    model_path      : path to the saved LightGBM model text file
+        (default: models/matcher.txt).
+    threshold       : probability cutoff. If None, loaded from threshold_path.
+    threshold_path  : path to models/threshold.json (used when threshold=None).
+
+    Returns
+    -------
+    dict mapping source1_entity_id → list[matched_candidate_entity_id]
+    Only pairs whose predicted probability >= threshold are included.
+    Entities with no predicted matches are omitted from the output.
+    """
+    # Load threshold if not provided
+    if threshold is None:
+        with open(threshold_path, "r", encoding="utf-8") as fh:
+            threshold = float(json.load(fh)["threshold"])
+
+    # Load model
+    booster = lgb.Booster(model_file=model_path)
+
+    if not candidate_pairs:
+        return {}
+
+    # Compute features
+    feat_rows = [compute_pair_features(s1, cand) for s1, cand in candidate_pairs]
+    feature_names = list(feat_rows[0].keys())
+    X = np.array([[r[f] for f in feature_names] for r in feat_rows], dtype=np.float32)
+
+    # Predict probabilities
+    probs = booster.predict(X)  # shape (n,)
+
+    # Group predictions back by source1_entity_id
+    results: dict[str, list[str]] = {}
+    for (s1_row, cand_row), prob in zip(candidate_pairs, probs):
+        if prob >= threshold:
+            s1_id   = s1_row["entity_id"]
+            cand_id = cand_row["entity_id"]
+            results.setdefault(s1_id, []).append(cand_id)
+
+    return results
+
+
+# ---------------------------------------------------------------------------
+# Save helpers
+# ---------------------------------------------------------------------------
+
+def save_model(model: lgb.LGBMClassifier, threshold: float) -> None:
+    """Persist the trained model and threshold to disk."""
+    os.makedirs(MODELS_DIR, exist_ok=True)
+    model.booster_.save_model(MODEL_PATH)
+    with open(THRESHOLD_PATH, "w", encoding="utf-8") as fh:
+        json.dump({"threshold": threshold}, fh, indent=2)
+    print(f"      Saved model  → {MODEL_PATH}", flush=True)
+    print(f"      Saved thresh → {THRESHOLD_PATH}", flush=True)
+
+
+# ---------------------------------------------------------------------------
+# Sanity check — reload from disk and reproduce val F_0.5
+# ---------------------------------------------------------------------------
+
+def sanity_check(
+    val_pairs: list[tuple[dict, dict]],
+    val_labels: list[int],
+    training_f05: float,
+) -> None:
+    """Load model + threshold from disk; verify val F_0.5 matches training run."""
+    print("\n[Sanity] Loading model from disk and re-scoring validation split …",
+          flush=True)
+
+    predictions = predict_matches(val_pairs)  # uses saved MODEL_PATH + THRESHOLD_PATH
+    threshold_used = json.load(open(THRESHOLD_PATH))["threshold"]
+
+    # Rebuild predicted labels in the same order as val_pairs
+    pred_labels = []
+    for s1_row, cand_row in val_pairs:
+        s1_id   = s1_row["entity_id"]
+        cand_id = cand_row["entity_id"]
+        predicted = int(cand_id in predictions.get(s1_id, []))
+        pred_labels.append(predicted)
+
+    pred_labels = np.array(pred_labels, dtype=np.int32)
+    true_labels = np.array(val_labels,  dtype=np.int32)
+
+    f05   = fbeta_score(true_labels, pred_labels, beta=0.5, zero_division=0)
+    prec  = precision_score(true_labels, pred_labels, zero_division=0)
+    rec   = recall_score(true_labels, pred_labels, zero_division=0)
+
+    print(f"      Threshold loaded:  {threshold_used:.2f}")
+    print(f"      F_0.5 from disk:   {f05:.4f}  (training run: {training_f05:.4f})")
+    print(f"      Precision:         {prec:.4f}")
+    print(f"      Recall:            {rec:.4f}")
+
+    delta = abs(f05 - training_f05)
+    if delta > 0.001:
+        print(
+            f"\nERROR: Sanity check FAILED — F_0.5 mismatch of {delta:.4f} "
+            f"(tolerance 0.001). Model on disk may be stale.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+    else:
+        print(f"      ✓ Sanity check PASSED (delta={delta:.6f} ≤ 0.001)")
 
 
 # ---------------------------------------------------------------------------
@@ -334,11 +472,23 @@ def main():
         print("ERROR: No positive labels found. Check GT alignment.", file=sys.stderr)
         sys.exit(1)
 
-    # 4. Train (grouped split)
+    # 4. Train (grouped split) — also recover val indices for sanity check
+    gss = GroupShuffleSplit(n_splits=1, test_size=0.2, random_state=RANDOM_STATE)
+    _, val_idx = next(gss.split(X, y, groups=groups_arr))
+
     model, X_val, y_val = train_model(X, y, feature_names, groups_arr)
 
-    # 5. Evaluate
+    # 5. Evaluate + select threshold
     results = evaluate(model, X_val, y_val, feature_names)
+
+    # 6. Save model and threshold to disk
+    print("\n[6] Saving model and threshold …", flush=True)
+    save_model(model, results["threshold"])
+
+    # 7. Sanity check — reload from disk, score same val split, compare F_0.5
+    val_pairs  = [pairs[i] for i in val_idx]
+    val_labels = [labels[i] for i in val_idx]
+    sanity_check(val_pairs, val_labels, results["f05"])
 
     return results
 
