@@ -25,11 +25,28 @@
 ---
 
 ## 3. Candidate Generation (Blocking)
-*Describe how you reduced the comparison space to a manageable candidate set.*
 
-- **Blocking keys used:** [e.g., PIN code, phonetic name encoding, TF-IDF, etc.]
-- **Candidate pairs generated:** [total]
-- **How you ensured true matches were not lost:**
+**Strategy:** Multi-probe blocking with four complementary probe types:
+1. **Name forward-prefix** — leading token prefix of the normalised entity name
+2. **Name reversed-token** — leading token of the reversed token sequence (catches word-order variation)
+3. **Address city segment** — city-level address token
+4. **Address house-number digits** — numeric house/building identifier
+
+**Full-scale tuning (2.2M Source-1 × 5M+ Source-2/3 records):**  
+The sample-validated design required two adjustments at production scale:
+
+- **Stopword list:** An explicit list of transliterated and generic legal-suffix tokens was built to remove degenerate high-frequency buckets (e.g. the Hindi abbreviation for "Limited", and English tokens such as "center", "partners", "group"). Without this, a small number of extremely common tokens produced unmanageably large buckets.
+- **Per-probe safety caps:** Upper bounds on bucket size were applied per probe type to bound the total candidate-set size:
+  - `city_cap = 80`
+  - `name_cap = 8,000`
+  - `nrev_cap = 3,000`
+  - `housenum_cap = 200`
+
+**Outcome:**  
+- Recall on 2,000-entity ground-truth-aligned validation sample: **~68%**
+- Average candidates per Source-1 entity: **~4,600**
+
+This configuration reflects a deliberate trade-off: bounded output size (required by the challenge's candidate-set-size scoring criterion) was prioritised over maximum achievable recall.
 
 ---
 
@@ -65,7 +82,8 @@ Results below are on the 2,000-entity validation sample (grouped split, not full
 ---
 
 ## 6. Conclusion
-*Summarize your approach, key achievements, and lessons learned in 2-3 sentences.*
+
+This project demonstrates end-to-end entity resolution via multi-probe blocking and gradient-boosted matching. Iterative tuning was required to balance recall against candidate-set size at production scale — a core trade-off in real-world entity resolution systems — ultimately yielding a high-precision matcher (F_0.5 = 0.9856) within a bounded candidate footprint.
 
 ---
 
