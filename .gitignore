@@ -38,3 +38,8 @@ dataset/train/train_ground_truth.tsv
 dataset/test/test_source1.tsv
 dataset/test/test_source2.tsv
 dataset/test/test_source3.tsv
+
+# Generated blocking output — too large for git (2-4 GB); store externally
+submissions/candidate_pairs.tsv
+submissions/test_candidate_pairs.tsv
+submissions/slice_test.tsv
