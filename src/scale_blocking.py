@@ -17,40 +17,30 @@ Usage
       --s3 dataset/test/test_source3.tsv \
       --out submissions/test_candidate_pairs.tsv
 
-  # Slice test (first 5000 S1 rows only, for validation):
-  python src/scale_blocking.py \
-      --s1 dataset/train/train_source1.tsv \
-      --s2 dataset/train/train_source2.tsv \
-      --s3 dataset/train/train_source3.tsv \
-      --out submissions/slice_test.tsv \
-      --s1-limit 5000
+  # Slice test (first N S1 rows only):
+  python src/scale_blocking.py ... --s1-limit 50000
 
 Design
 ------
-This script is a pure scale-up wrapper around the already-validated blocking.py
-functions.  It does NOT reimplement any blocking logic — it calls:
+Pure scale-up wrapper around blocking.py.  No blocking logic reimplemented here.
+Calls:
+  generate_blocking_keys()  (probe generation)
+  get_candidates()          (city_cap=80 — unchanged)
 
-  generate_blocking_keys()   from blocking.py  (probe generation)
-  get_candidates()           from blocking.py  (city_cap=80 filtering)
+Write-path optimisations (all output logic only — zero change to blocking):
+  - Output file opened in BINARY mode with a 64 MB OS buffer.
+  - Lines accumulated in a list; flushed every WRITE_BATCH lines with a single
+    b"".join() + fh.write() call — eliminates per-row Python overhead.
+  - Candidate list joined with b",".join() on pre-encoded bytes — avoids
+    repeated str→bytes conversion and csv.writer machinery.
+  - sorted() dropped from candidate output (order within a row irrelevant for
+    blocking); set→list conversion is O(n), sort is O(n log n).
 
-The only thing added here is:
-
-  1. Streaming S2/S3 into memory-efficient inverted indexes (entity_id lists only).
-  2. Bucket-size cap (MAX_BUCKET_SIZE) applied to the index BEFORE passing it to
-     get_candidates.  This cap is the full-scale analogue of the sample cap: at 5k
-     rows the largest bucket was ~300 so the sample naturally produced ~77 avg
-     candidates.  At 5M rows, buckets like "india::nrev:लिम" grow to 190k — these
-     are degenerate keys (legal-suffix reversed tokens, single-digit house numbers)
-     that the sample never exposed.  Capping them at MAX_BUCKET_SIZE replicates the
-     sample's effective behavior: any bucket so large it is non-discriminating is
-     treated as noise and dropped entirely from the lookup.
-  3. Chunked S1 streaming (CHUNK_SIZE rows at a time) to avoid full-file RAM.
-  4. Progress reporting every PROGRESS_INTERVAL S1 rows.
-
-Output format (TSV, no header):
-  source1_entity_id<TAB>candidate_entity_ids
-  where candidate_entity_ids is a comma-separated list (S2-/S3- only,
-  no duplicates, sorted for determinism) or empty string if none.
+Full-scale bucket control (applied when building the index):
+  - city probes   : handled by city_cap=80 inside get_candidates; pass-through here.
+  - nrev probes   : drop NREV_GARBAGE_TOKENS; safety cap NREV_SAFETY_CAP=3000.
+  - name probes   : safety cap NAME_SAFETY_CAP=8000.
+  - housenum probes: cap HOUSENUM_CAP=200.
 """
 
 from __future__ import annotations
@@ -62,9 +52,6 @@ import sys
 import time
 from pathlib import Path
 
-# ---------------------------------------------------------------------------
-# Path setup — src/ directory (where blocking.py lives) must be on sys.path
-# ---------------------------------------------------------------------------
 _SRC_DIR = Path(__file__).resolve().parent
 if str(_SRC_DIR) not in sys.path:
     sys.path.insert(0, str(_SRC_DIR))
@@ -77,28 +64,34 @@ from blocking import (
 )
 
 # ---------------------------------------------------------------------------
-# Constants
+# Tuning constants
 # ---------------------------------------------------------------------------
 
-CHUNK_SIZE        = 50_000   # S1 rows per processing batch
-PROGRESS_INTERVAL = 200_000  # print progress line every N S1 rows
-FREQ_SAMPLE_SIZE  = 10_000   # S1 rows used to build freq_stopwords
-CITY_CAP          = 80       # passed directly to get_candidates (unchanged)
+CHUNK_SIZE        = 50_000
+PROGRESS_INTERVAL = 200_000
+FREQ_SAMPLE_SIZE  = 10_000
+CITY_CAP          = 80
 
-# Max entries in any single probe bucket before it is discarded as
-# non-discriminating at full dataset scale.  Rationale:
-#   - Validated sample: max bucket ~300, avg cands ~77 → ratio ~1:4
-#   - Full dataset is ~1000× larger, so we scale the cutoff proportionally:
-#     300 × (5_000_000 / 5_000) would be too generous; instead we cap at a
-#     level that drops clearly degenerate keys (nrev:लिम @190k, housenum:1
-#     @81k) while keeping genuinely specific buckets (nrev:smi, name:aco…).
-#   - 500 is a conservative cutoff: keeps all specific buckets, kills only
-#     the handful of near-universal keys.
-MAX_BUCKET_SIZE = 500
+# nrev tokens identified as garbage via full-corpus bucket-size analysis.
+NREV_GARBAGE_TOKENS: frozenset[str] = frozenset([
+    'लिम', 'लि', 'లిమ', 'ಲಿಮ', 'லிம',
+    'cen', 'ser', 'par', 'gro', 'ind', 'hol', 'l.l',
+    'ass', 'con', 'pro', 'tra', 'lp', 'tec', 'ven',
+    'sol', 'pub', 'cli', 'bro', 'med', 'exp', 'hea',
+    'com', 'ent', 'inf', 'car', 'pre',
+])
+
+NAME_SAFETY_CAP = 300
+NREV_SAFETY_CAP = 3_000
+HOUSENUM_CAP    = 200
+
+# Write-path tuning
+WRITE_BATCH     = 10_000   # lines accumulated before a single fh.write() call
+WRITE_BUF_BYTES = 64 << 20  # 64 MB OS-level write buffer
 
 
 # ---------------------------------------------------------------------------
-# Index builder — streams one source file, no full-row storage
+# Index builder
 # ---------------------------------------------------------------------------
 
 def _build_index_from_file(
@@ -107,13 +100,8 @@ def _build_index_from_file(
     label: str,
     row_limit: int = 0,
 ) -> dict[str, list[str]]:
-    """Stream *filepath* and build probe_key → [entity_id, …].
-
-    Only entity_ids stored (not full rows), so memory ~ keys × avg_bucket.
-    """
     index: dict[str, list[str]] = collections.defaultdict(list)
     row_count = 0
-
     with open(filepath, encoding="utf-8", errors="replace", newline="") as fh:
         reader = csv.DictReader(fh, delimiter="\t")
         for row in reader:
@@ -131,28 +119,46 @@ def _build_index_from_file(
             for k in keys:
                 index[k].append(eid)
             row_count += 1
-
-    print(f"  [{label}] indexed {row_count:,} rows → {len(index):,} probe keys",
+    print(f"  [{label}] indexed {row_count:,} rows → {len(index):,} raw probe keys",
           flush=True)
     return dict(index)
 
 
-def _cap_index(
+def _filter_index(
     index: dict[str, list[str]],
-    max_size: int,
-) -> tuple[dict[str, list[str]], int]:
-    """Return a copy of *index* with all buckets larger than *max_size* removed.
-
-    Returns (capped_index, n_dropped_keys).
-    """
-    capped = {}
-    dropped = 0
+    label: str,
+) -> dict[str, list[str]]:
+    filtered: dict[str, list[str]] = {}
+    dropped_nrev_garbage = dropped_nrev_cap = dropped_name_cap = dropped_hnum_cap = 0
     for k, v in index.items():
-        if len(v) <= max_size:
-            capped[k] = v
+        if '::nrev:' in k:
+            tok = k.split('::nrev:')[1]
+            if tok in NREV_GARBAGE_TOKENS:
+                dropped_nrev_garbage += 1
+                continue
+            if len(v) > NREV_SAFETY_CAP:
+                dropped_nrev_cap += 1
+                continue
+            filtered[k] = v
+        elif '::name:' in k:
+            if len(v) > NAME_SAFETY_CAP:
+                dropped_name_cap += 1
+                continue
+            filtered[k] = v
+        elif '::housenum:' in k:
+            if len(v) > HOUSENUM_CAP:
+                dropped_hnum_cap += 1
+                continue
+            filtered[k] = v
         else:
-            dropped += 1
-    return capped, dropped
+            filtered[k] = v
+    print(
+        f"  [{label}] filtered: {len(filtered):,} keys kept | "
+        f"nrev garbage={dropped_nrev_garbage} | nrev cap={dropped_nrev_cap} | "
+        f"name cap={dropped_name_cap} | hnum cap={dropped_hnum_cap}",
+        flush=True,
+    )
+    return filtered
 
 
 # ---------------------------------------------------------------------------
@@ -165,93 +171,87 @@ def run_blocking(
     s3_path: str,
     out_path: str,
     s1_limit: int = 0,
+    s1_id_filter: set[str] | None = None,
 ) -> tuple[int, float, int]:
     overall_start = time.time()
 
     print("=" * 65)
-    print(f"S1 : {s1_path}" + (f"  [first {s1_limit:,} rows]" if s1_limit else ""))
+    print(f"S1 : {s1_path}" + (f"  [first {s1_limit:,} rows]" if s1_limit else "")
+          + (f"  [id-filter: {len(s1_id_filter):,} IDs]" if s1_id_filter else ""))
     print(f"S2 : {s2_path}")
     print(f"S3 : {s3_path}")
     print(f"OUT: {out_path}")
-    print(f"city_cap={CITY_CAP}  max_bucket_size={MAX_BUCKET_SIZE}")
+    print(f"city_cap={CITY_CAP}  name_cap={NAME_SAFETY_CAP}  "
+          f"nrev_garbage={len(NREV_GARBAGE_TOKENS)}tokens+cap{NREV_SAFETY_CAP}  "
+          f"hnum_cap={HOUSENUM_CAP}  write_batch={WRITE_BATCH}")
     print("=" * 65, flush=True)
 
-    # ------------------------------------------------------------------
-    # Step 1: freq stopwords from a sample of S1
-    # ------------------------------------------------------------------
+    # Step 1: freq stopwords
     print(f"\n[1/4] Building freq_stopwords from first {FREQ_SAMPLE_SIZE:,} S1 rows …",
           flush=True)
     t0 = time.time()
     sample_rows = load_sample(s1_path, n=FREQ_SAMPLE_SIZE)
     freq_stopwords = build_frequency_stopwords(sample_rows, threshold=50)
-    print(f"      freq_stopwords ({len(freq_stopwords)}): {sorted(freq_stopwords)[:20]}",
-          flush=True)
-    print(f"      done in {time.time()-t0:.1f}s", flush=True)
-
-    # ------------------------------------------------------------------
-    # Step 2: build + cap S2 index
-    # ------------------------------------------------------------------
-    print("\n[2/4] Building inverted index from S2 …", flush=True)
-    t0 = time.time()
-    raw_s2 = _build_index_from_file(s2_path, freq_stopwords, "S2")
-    index_s2, dropped_s2 = _cap_index(raw_s2, MAX_BUCKET_SIZE)
-    del raw_s2
-    print(f"      S2: {len(index_s2):,} keys kept, {dropped_s2} oversized keys dropped "
-          f"(>{MAX_BUCKET_SIZE})  [{time.time()-t0:.1f}s]", flush=True)
-
-    # ------------------------------------------------------------------
-    # Step 3: build + cap S3 index
-    # ------------------------------------------------------------------
-    print("\n[3/4] Building inverted index from S3 …", flush=True)
-    t0 = time.time()
-    raw_s3 = _build_index_from_file(s3_path, freq_stopwords, "S3")
-    index_s3, dropped_s3 = _cap_index(raw_s3, MAX_BUCKET_SIZE)
-    del raw_s3
-    print(f"      S3: {len(index_s3):,} keys kept, {dropped_s3} oversized keys dropped "
-          f"(>{MAX_BUCKET_SIZE})  [{time.time()-t0:.1f}s]", flush=True)
-
-    # Merge capped S2 + S3 into one combined index
-    print("\n      Merging capped S2+S3 indexes …", end=" ", flush=True)
-    t0 = time.time()
-    combined_index: dict[str, list[str]] = collections.defaultdict(list)
-    for k, v in index_s2.items():
-        combined_index[k].extend(v)
-    for k, v in index_s3.items():
-        combined_index[k].extend(v)
-    # After merging, re-apply cap so cross-source combined buckets stay bounded
-    combined_raw = dict(combined_index)
-    combined_index, dropped_merged = _cap_index(combined_raw, MAX_BUCKET_SIZE)
-    del combined_raw, index_s2, index_s3
-    print(f"{len(combined_index):,} keys  ({dropped_merged} additional merged drops)  "
+    print(f"      freq_stopwords ({len(freq_stopwords)}): {sorted(freq_stopwords)[:20]}  "
           f"[{time.time()-t0:.1f}s]", flush=True)
 
-    # ------------------------------------------------------------------
-    # Step 4: stream S1, query candidates, write output
-    # ------------------------------------------------------------------
-    print(f"\n[4/4] Streaming S1 in chunks of {CHUNK_SIZE:,} rows …", flush=True)
+    # Step 2: S2 index
+    print("\n[2/4] Building inverted index from S2 …", flush=True)
+    t0 = time.time()
+    index_s2 = _filter_index(_build_index_from_file(s2_path, freq_stopwords, "S2"), "S2")
+    print(f"      S2 done [{time.time()-t0:.1f}s]", flush=True)
+
+    # Step 3: S3 index
+    print("\n[3/4] Building inverted index from S3 …", flush=True)
+    t0 = time.time()
+    index_s3 = _filter_index(_build_index_from_file(s3_path, freq_stopwords, "S3"), "S3")
+    print(f"      S3 done [{time.time()-t0:.1f}s]", flush=True)
+
+    # Merge
+    print("\n      Merging filtered S2+S3 indexes …", end=" ", flush=True)
+    t0 = time.time()
+    combined: dict[str, list[str]] = collections.defaultdict(list)
+    for k, v in index_s2.items():
+        combined[k].extend(v)
+    for k, v in index_s3.items():
+        combined[k].extend(v)
+    combined_index = dict(combined)
+    del index_s2, index_s3, combined
+    print(f"{len(combined_index):,} keys  [{time.time()-t0:.1f}s]", flush=True)
+
+    # Step 4: stream S1 and write output
+    print(f"\n[4/4] Streaming S1 …", flush=True)
     Path(out_path).parent.mkdir(parents=True, exist_ok=True)
 
-    total_rows  = 0
-    total_cands = 0
-    error_rows  = 0
-    max_cands   = 0
-    t_stream    = time.time()
+    # Pre-encode the tab and newline bytes used in every output line
+    TAB = b"\t"
+    NL  = b"\n"
+
+    total_rows    = 0
+    total_cands   = 0
+    error_rows    = 0
+    max_cands     = 0
+    t_stream      = time.time()
     last_milestone = 0
 
+    # Open output in BINARY mode with a large OS buffer — avoids text-mode
+    # encoding overhead and lets us build lines as byte strings directly.
     with open(s1_path, encoding="utf-8", errors="replace", newline="") as fh_in, \
-         open(out_path, "w", encoding="utf-8", newline="") as fh_out:
+         open(out_path, "wb", buffering=WRITE_BUF_BYTES) as fh_out:
 
-        writer = csv.writer(fh_out, delimiter="\t", lineterminator="\n")
         reader = csv.DictReader(fh_in, delimiter="\t")
+        s1_chunk: list[dict] = []
+        line_batch: list[bytes] = []
 
-        chunk: list[dict] = []
-
-        def _flush(chunk: list[dict]) -> tuple[int, int, int, int]:
+        def _flush_chunk(chunk: list[dict]) -> tuple[int, int, int, int]:
+            """Process chunk; accumulate byte lines; return (rows, cands, errs, max)."""
             rows_out = cands_out = errs = max_c = 0
             for row in chunk:
                 eid = (row.get("entity_id") or "").strip()
                 if not eid:
                     errs += 1
+                    continue
+                if s1_id_filter is not None and eid not in s1_id_filter:
                     continue
                 try:
                     cands = get_candidates(
@@ -264,68 +264,72 @@ def run_blocking(
                         city_cap=CITY_CAP,
                     )
                 except Exception as exc:
-                    print(f"\n  ERROR on entity_id={eid}: {exc}", flush=True)
+                    print(f"\n  ERROR on {eid}: {exc}", flush=True)
                     errs += 1
                     continue
 
-                filtered = sorted(
-                    c for c in cands
-                    if c.startswith("S2-") or c.startswith("S3-")
-                )
-                writer.writerow([eid, ",".join(filtered)])
+                # Filter to S2-/S3- only — no sort (order irrelevant for blocking)
+                filtered = [c for c in cands
+                            if c.startswith("S2-") or c.startswith("S3-")]
+
+                # Build output line as bytes directly — avoids str→bytes per write
+                eid_b   = eid.encode()
+                cands_b = b",".join(c.encode() for c in filtered)
+                line_batch.append(eid_b + TAB + cands_b + NL)
+
                 n = len(filtered)
                 cands_out += n
                 rows_out  += 1
                 if n > max_c:
                     max_c = n
+
+                # Flush write batch when it reaches WRITE_BATCH lines
+                if len(line_batch) >= WRITE_BATCH:
+                    fh_out.write(b"".join(line_batch))
+                    line_batch.clear()
+
             return rows_out, cands_out, errs, max_c
 
+        rows_seen = 0
         for row in reader:
-            if s1_limit and total_rows + len(chunk) >= s1_limit:
-                remaining = s1_limit - total_rows - len(chunk)
-                if remaining > 0:
-                    chunk.append(row)
-                if len(chunk) >= min(CHUNK_SIZE, s1_limit - total_rows):
-                    r, c, e, m = _flush(chunk)
-                    total_rows  += r
-                    total_cands += c
-                    error_rows  += e
-                    max_cands    = max(max_cands, m)
-                    chunk = []
-                if total_rows >= s1_limit:
-                    break
-                continue
+            rows_seen += 1
+            if s1_limit and rows_seen > s1_limit:
+                break
+            s1_chunk.append(row)
 
-            chunk.append(row)
-
-            if len(chunk) >= CHUNK_SIZE:
-                r, c, e, m = _flush(chunk)
+            if len(s1_chunk) >= CHUNK_SIZE:
+                r, c, e, m = _flush_chunk(s1_chunk)
                 total_rows  += r
                 total_cands += c
                 error_rows  += e
                 max_cands    = max(max_cands, m)
-                chunk = []
+                s1_chunk = []
 
                 milestone = total_rows // PROGRESS_INTERVAL
                 if milestone > last_milestone:
                     last_milestone = milestone
                     elapsed = time.time() - t_stream
-                    rate = total_rows / elapsed if elapsed > 0 else 0
+                    rate = rows_seen / elapsed if elapsed > 0 else 0
                     avg  = total_cands / total_rows if total_rows else 0
                     print(
-                        f"  … {total_rows:>9,} S1 rows | "
+                        f"  … {total_rows:>9,} written ({rows_seen:,} seen) | "
                         f"avg cands={avg:.1f} | max={max_cands} | "
                         f"{rate:,.0f} rows/s | elapsed={elapsed:.0f}s",
                         flush=True,
                     )
 
-        # flush remainder
-        if chunk:
-            r, c, e, m = _flush(chunk)
+        # Final partial chunk
+        if s1_chunk:
+            r, c, e, m = _flush_chunk(s1_chunk)
             total_rows  += r
             total_cands += c
             error_rows  += e
             max_cands    = max(max_cands, m)
+
+        # Flush any remaining buffered lines
+        if line_batch:
+            fh_out.write(b"".join(line_batch))
+            line_batch.clear()
 
     total_elapsed = time.time() - overall_start
     avg_cands = total_cands / total_rows if total_rows else 0
@@ -351,15 +355,13 @@ def run_blocking(
 # ---------------------------------------------------------------------------
 
 def _parse_args() -> argparse.Namespace:
-    p = argparse.ArgumentParser(
-        description="Full-dataset chunked blocking runner (no pandas, streaming S1)."
-    )
-    p.add_argument("--s1",       required=True, help="Path to source1 TSV")
-    p.add_argument("--s2",       required=True, help="Path to source2 TSV")
-    p.add_argument("--s3",       required=True, help="Path to source3 TSV")
-    p.add_argument("--out",      required=True, help="Output candidate_pairs.tsv path")
+    p = argparse.ArgumentParser()
+    p.add_argument("--s1",       required=True)
+    p.add_argument("--s2",       required=True)
+    p.add_argument("--s3",       required=True)
+    p.add_argument("--out",      required=True)
     p.add_argument("--s1-limit", type=int, default=0,
-                   help="Process only the first N rows of S1 (0=all; for slice tests)")
+                   help="Process only first N S1 rows (0=all)")
     return p.parse_args()
 
 
