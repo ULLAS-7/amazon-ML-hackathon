@@ -81,9 +81,9 @@ NREV_GARBAGE_TOKENS: frozenset[str] = frozenset([
     'com', 'ent', 'inf', 'car', 'pre',
 ])
 
-NAME_SAFETY_CAP = 300
-NREV_SAFETY_CAP = 3_000
-HOUSENUM_CAP    = 200
+NAME_SAFETY_CAP = 100
+NREV_SAFETY_CAP = 1_000
+HOUSENUM_CAP    = 100
 
 # Write-path tuning
 WRITE_BATCH     = 10_000   # lines accumulated before a single fh.write() call
