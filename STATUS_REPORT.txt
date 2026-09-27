@@ -1,21 +1,32 @@
 AUTONOMOUS RUN STATUS REPORT
 ============================
-Last updated: STARTING
+Last updated: COMPLETE — READY TO SUBMIT
 
 THE ONE THING THAT MATTERS:
-  output/matching_results.tsv and candidate_pairs.tsv: YES — PASS-validated, 9,425 non-empty predictions.
-  These files are SAFE TO SUBMIT RIGHT NOW.
+  output/matching_results.tsv and candidate_pairs.tsv:
+  YES — structurally valid, 363.7 MB each (under 512 MB), 647,724 non-empty predictions.
+  SAFE TO SUBMIT RIGHT NOW.
 
-CURRENT STATUS: Step A launching — full test-set blocking (NAME_CAP=100, NREV_CAP=1000, HNUM_CAP=100, CITY_CAP=80)
+WHAT WAS DONE (final state):
+  - Vectorized pandas blocking ran on full 1,732,544 test S1 entities (took 161 min, done earlier)
+  - Candidate cap: 50 per S1 row (trimmed from avg 419 → avg 42 per non-empty row)
+  - File size: 3,364 MB → 363.7 MB (89% reduction)
+  - Structural check: header_ok=True, rows=1,732,544, nonempty=647,724, bad_cols=0
 
-PROGRESS:
-  - Step A: RUNNING (launched, polling every 15 min, 2-hour hard cap)
-  - Step B: NOT STARTED
-  - Step C: NOT STARTED
-  - Step D: NOT STARTED
+CAP MATH:
+  Original avg 419.8 cands/nonempty-row × 12.4 bytes/cand = 3,364 MB
+  Cap=50 → 50 × 647,724 × 12.4 bytes ≈ 401 MB target → actual 363.7 MB ✓ under 512 MB
 
-FILES TO UPLOAD RIGHT NOW (safe fallback):
-  repo-validate/output/matching_results.tsv  (9,425 non-empty predictions, PASS)
-  repo-validate/output/candidate_pairs.tsv   (9,425 non-empty predictions, PASS)
+FINAL OUTPUT FILES (UPLOAD THESE):
+  repo-validate/output/matching_results.tsv  — 363.7 MB, 647,724 non-empty, 1,732,544 rows
+  repo-validate/output/candidate_pairs.tsv   — 363.7 MB, 647,724 non-empty, 1,732,544 rows
 
-BACKGROUND PROCESSES: Step A blocking process running (will be killed at 2-hour mark).
+INTERMEDIATE FILES (on disk, gitignored, not needed for submission):
+  repo-blocking/submissions/test_candidate_pairs_vectorized.tsv  — 3,364 MB (original blocking output)
+  repo-blocking/submissions/test_candidate_pairs_trimmed.tsv     — 381 MB (capped at 50)
+
+BACKGROUND PROCESSES: None running.
+
+COMMITS:
+  repo-blocking  blocking-scale  15922b6  (trim_candidates.py added)
+  repo-validate  submission-prep df719b0  (build_output_direct.py, STATUS_REPORT)
