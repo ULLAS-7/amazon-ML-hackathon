@@ -1,0 +1,21 @@
+AUTONOMOUS RUN STATUS REPORT
+============================
+Last updated: STARTING
+
+THE ONE THING THAT MATTERS:
+  output/matching_results.tsv and candidate_pairs.tsv: YES — PASS-validated, 9,425 non-empty predictions.
+  These files are SAFE TO SUBMIT RIGHT NOW.
+
+CURRENT STATUS: Step A launching — full test-set blocking (NAME_CAP=100, NREV_CAP=1000, HNUM_CAP=100, CITY_CAP=80)
+
+PROGRESS:
+  - Step A: RUNNING (launched, polling every 15 min, 2-hour hard cap)
+  - Step B: NOT STARTED
+  - Step C: NOT STARTED
+  - Step D: NOT STARTED
+
+FILES TO UPLOAD RIGHT NOW (safe fallback):
+  repo-validate/output/matching_results.tsv  (9,425 non-empty predictions, PASS)
+  repo-validate/output/candidate_pairs.tsv   (9,425 non-empty predictions, PASS)
+
+BACKGROUND PROCESSES: Step A blocking process running (will be killed at 2-hour mark).
