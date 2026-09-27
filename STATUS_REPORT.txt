@@ -1,32 +1,23 @@
 AUTONOMOUS RUN STATUS REPORT
 ============================
-Last updated: COMPLETE — READY TO SUBMIT
+Last updated: 18:35 — STEP 1-3 RUNNING (train_and_score.py launched)
 
 THE ONE THING THAT MATTERS:
-  output/matching_results.tsv and candidate_pairs.tsv:
-  YES — structurally valid, 363.7 MB each (under 512 MB), 647,724 non-empty predictions.
-  SAFE TO SUBMIT RIGHT NOW.
+  output/matching_results.tsv: YES — PASS-validated, 363.7 MB, 647,724 non-empty (no-model fallback).
+  SAFE TO SUBMIT RIGHT NOW — do not need to wait for model to complete.
 
-WHAT WAS DONE (final state):
-  - Vectorized pandas blocking ran on full 1,732,544 test S1 entities (took 161 min, done earlier)
-  - Candidate cap: 50 per S1 row (trimmed from avg 419 → avg 42 per non-empty row)
-  - File size: 3,364 MB → 363.7 MB (89% reduction)
-  - Structural check: header_ok=True, rows=1,732,544, nonempty=647,724, bad_cols=0
+CURRENT STATUS:
+  train_and_score.py running (TerminalId: term_1790514362028_e8nhi5bdfkn)
+  Steps 1-4 in one script:
+    1. Build labeled pairs (50k S1 entities, max 20 neg/entity) from train candidates + GT
+    2. Compute features (10 pairwise similarity features)
+    3. Train LightGBM (200 trees, depth 5), sweep thresholds for entity-level F_0.5
+    4. Score test_candidate_pairs_trimmed.tsv in 100k-entity chunks → test_final_scored.tsv
 
-CAP MATH:
-  Original avg 419.8 cands/nonempty-row × 12.4 bytes/cand = 3,364 MB
-  Cap=50 → 50 × 647,724 × 12.4 bytes ≈ 401 MB target → actual 363.7 MB ✓ under 512 MB
+HARD DEADLINE: 20:34:45 (2 hours from start 18:34:45)
 
-FINAL OUTPUT FILES (UPLOAD THESE):
-  repo-validate/output/matching_results.tsv  — 363.7 MB, 647,724 non-empty, 1,732,544 rows
-  repo-validate/output/candidate_pairs.tsv   — 363.7 MB, 647,724 non-empty, 1,732,544 rows
-
-INTERMEDIATE FILES (on disk, gitignored, not needed for submission):
-  repo-blocking/submissions/test_candidate_pairs_vectorized.tsv  — 3,364 MB (original blocking output)
-  repo-blocking/submissions/test_candidate_pairs_trimmed.tsv     — 381 MB (capped at 50)
-
-BACKGROUND PROCESSES: None running.
-
-COMMITS:
-  repo-blocking  blocking-scale  15922b6  (trim_candidates.py added)
-  repo-validate  submission-prep df719b0  (build_output_direct.py, STATUS_REPORT)
+STEPS REMAINING AFTER TRAINING:
+  5. Build output_v7 from scored results
+  6. Structural check + size check
+  7. Promote only if F_0.5 > 0.10 and size < 512 MB
+  8. Commit + push scripts
